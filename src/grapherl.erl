@@ -37,6 +37,7 @@
 -export([applications/3]).
 -export([modules/2]).
 -export([modules/3]).
+-export([calls/2, calls/3]).
 
 -ifdef(TEST).
 -include("grapherl_tests.hrl").
@@ -56,21 +57,25 @@ main(Args) ->
 
 run({Options, [Dir, Target]}) ->
     case get_mode(Options) of
-        {app, RestOpt} -> run(applications, [Dir, Target, RestOpt]);
-        {mod, RestOpt} -> run(modules, [Dir, Target, RestOpt])
+        {app, RestOpt}   -> run(applications, [Dir, Target, RestOpt]);
+        {mod, RestOpt}   -> run(modules, [Dir, Target, RestOpt]);
+        {calls, RestOpt} -> run(calls, [Dir, Target, RestOpt])
     end;
 run({_Options, _Other}) ->
     print_options(), halt(1).
 
 get_mode(Options) ->
-    case proplists:split(Options, [app, mod]) of
-        {[[app], []], Rest} -> {app, Rest};
-        {[[], [mod]], Rest} -> {mod, Rest}
+    case proplists:split(Options, [app, mod, calls]) of
+        {[[app], [], []], Rest}  -> {app, Rest};
+        {[[], [mod], []], Rest}  -> {mod, Rest};
+        {[[], [], [calls]], Rest} -> {calls, Rest}
     end.
 
 options() ->
     [{help, $h, "help", undefined,
       "Display this help text"},
+     {calls, $c, "calls", undefined,
+      "Analyse calls (caution: huge) (mutually exclusive)"},
      {mod, $m, "modules", undefined,
       "Analyse module dependencies (mutually exclusive)"},
      {app, $a, "applications", undefined,
@@ -167,9 +172,97 @@ modules(Dir, Target, Options) ->
             Error
     end.
 
+calls(Dir, Target) ->
+    calls(Dir, Target, []).
+
+calls(Dir, Target, Options) ->
+    check_dot(),
+    try
+        initialize_xref(?MODULE, Options),
+        [{AppName, _, _}] = find_applications([get_path(Dir)]),
+
+        ok(xref:add_application(?MODULE, Dir, [{name, AppName}])),
+        {ok, Calls} = xref:q(?MODULE, f("E || ~s", [AppName])),
+        CallsByMod  = keygroup(fun mod/1, Calls),
+
+        with_dot(fun (File) ->
+                         io:format(File, "digraph \"~s call graph\" { pack=true; packmode=clust; size=\"10,100\"; ratio=compress;~n", [AppName]),
+                         write_calls(File, CallsByMod),
+                         io:format(File, "}~n", [])
+                 end, Target, get_type(Options, Target)),
+        stop_xref(?MODULE)
+    catch
+        throw:Error ->
+            stop_xref(?MODULE),
+            Error
+    end.
+
+write_calls(File, CallsByMod) ->
+    lists:foreach(fun ({ModCalls, ModIdx}) ->
+                          ModName   = mod(hd(ModCalls)),
+                          Functions = lists:usort(lists:flatmap(fun tuple_to_list/1, ModCalls)),
+                          {IntFuns, ExtFuns} = lists:partition(fun ({M, _, _}) -> M == ModName end, Functions),
+
+                          io:format(File, "subgraph cluster~b {~n", [ModIdx]),
+                          io:format(File, "node [shape=box, style=filled, fillcolor=white]; label=~s; style=filled; color=lightgrey~n", [ModName]),
+                          lists:foreach(fun (IntFun) ->
+                                                io:format(File, "\"~s\"[label=\"~s\"];~n", [ext_mfa_nodename(ModIdx, IntFun), fa_nodename(IntFun)])
+                                        end, IntFuns),
+                          lists:foreach(fun (ExtFun) ->
+                                                io:format(File, "\"~s\"[label=\"~s\", shape=note];~n",
+                                                                [ext_mfa_nodename(ModIdx, ExtFun), mfa_nodename(ExtFun)])
+
+                                        end, ExtFuns),
+                          lists:foreach(fun ({Caller, Callee}) ->
+                                                io:format(File, "\"~s\" -> \"~s\";~n",
+                                                                [ext_mfa_nodename(ModIdx, Caller), ext_mfa_nodename(ModIdx, Callee)])
+                                        end, ModCalls),
+                          io:format(File, "}~n", [])
+                  end, lists:zip(CallsByMod, lists:seq(1, length(CallsByMod)))).
+
 %%==============================================================================
 %% Internal Functions
 %%==============================================================================
+f(Fmt, Args) ->
+    lists:flatten(io_lib:format(Fmt, Args)).
+
+mod({{M, _, _}, _}) -> M;
+mod({M, _, _})      -> M.
+
+ext_mfa_nodename(ModIdx, MFA) ->
+    f("~b-~s", [ModIdx, mfa_nodename(MFA)]).
+mfa_nodename({M, F, A}) ->
+    f("~s:~s/~b", [M, F, A]).
+fa_nodename({_, F, A}) ->
+    f("~s/~b", [F, A]).
+
+keygroup(Fn, List) ->
+    lists:foldl(fun (Item, Acc) ->
+                        case Acc of
+                            [Group1 | GroupN] ->
+                                case Fn(Item) =:= Fn(hd(Group1)) of
+                                    true  -> [[Item | Group1] | GroupN];
+                                    false -> [[Item] | Acc]
+                                end;
+                            _ ->
+                                [[Item] | Acc]
+                        end
+                end, [], List).
+
+find_applications(Path) ->
+    lists:ukeysort(1, find_applications1(Path)).
+
+find_applications1(Path) ->
+    lists:flatmap(fun (Dir) ->
+                      lists:flatmap(fun (AF) ->
+                                        case file:consult(filename:join(Dir, AF)) of
+                                            {ok, [{application, Name, Keys}]} ->
+                                                [{Name, Dir, proplists:get_value(modules, Keys, [])}];
+                                            _Other ->
+                                                []
+                                        end
+                                    end, filelib:wildcard("*.app", Dir))
+                  end, Path).
 
 get_path(Dir) ->
     case filelib:wildcard(filename:join(Dir, "*.beam")) of
@@ -232,11 +325,18 @@ check_dot() ->
     end.
 
 dot(File, Target, Type) ->
+    with_dot(fun (Fd) -> io:put_chars(Fd, File) end, Target, Type).
+
+with_dot(Function, Target, Type) ->
     TmpFile = string:strip(os:cmd("mktemp -t " ?MODULE_STRING ".XXXX"), both, $\n),
-    ok = file:write_file(TmpFile, File),
+    {ok, Fd} = file:open(TmpFile, [write]),
+    try
+        Function(Fd)
+    after
+        file:close(Fd)
+    end,
     TargetName = add_extension(Target, Type),
-    Result = os:cmd(io_lib:format("dot -T~p -o~p ~p",
-                                  [Type, TargetName, TmpFile])),
+    Result = cmd("dot -T~p -o\"~s\" ~p", [Type, TargetName, TmpFile]),
     ok = file:delete(TmpFile),
     {Result, TargetName}.
 
@@ -255,3 +355,10 @@ ok(Error)        -> throw(Error).
 
 ifc(true, True, _)   -> True;
 ifc(false, _, False) -> False.
+
+cmd(Command, Args) ->
+    CmdStr = f(Command, Args),
+    io:format("===== ~s~n", [CmdStr]),
+    Output = os:cmd(CmdStr),
+    io:put_chars(Output),
+    Output.
